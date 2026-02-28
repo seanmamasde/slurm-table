@@ -419,7 +419,7 @@ def main():
             print(f"Error: {cmd} not found in PATH", file=sys.stderr)
             sys.exit(1)
 
-    top = get_top_table()
+    # top = get_top_table()
     jobs_by_node = get_running_jobs()
     nodes = get_nodes()
 
@@ -431,11 +431,11 @@ def main():
                 "state": "UNKNOWN",
                 "total_gpus": max(8, inferred),
             }
-    if top:
-        print(top)
-        print()
-        print("---")
-        print()
+    # if top:
+    #     print(top)
+    #     print()
+    #     print("---")
+    #     print()
     print(render_bottom_table(nodes, jobs_by_node))
 
 
