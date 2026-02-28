@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+import json
+import re
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+
+SLOT_WIDTH = 8
+
+
+def run_cmd(cmd):
+    return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+
+def try_cmd(cmd):
+    try:
+        return run_cmd(cmd)
+    except Exception:
+        return None
+
+
+def natural_node_key(name):
+    m = re.match(r"^(.*?)(\d+)$", name)
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (name, -1)
+
+
+def expand_nodelist(expr):
+    expr = expr.strip()
+    if not expr:
+        return []
+    if "[" not in expr:
+        return [expr]
+
+    m = re.match(r"^(.*?)\[(.*?)\](.*)$", expr)
+    if not m:
+        return [expr]
+
+    prefix, body, suffix = m.groups()
+    out = []
+    for part in body.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            width = max(len(a), len(b))
+            for i in range(int(a), int(b) + 1):
+                out.append(f"{prefix}{i:0{width}d}{suffix}")
+        else:
+            out.append(f"{prefix}{part}{suffix}")
+    return out
+
+
+def parse_gpu_count_from_text(*values):
+    nums = []
+    for value in values:
+        if not value:
+            continue
+        s = str(value)
+        nums.extend(re.findall(r"(?:gres/)?gpu[:=](\d+)", s))
+        nums.extend(re.findall(r"gpu:[^:|, ]+:(\d+)", s))
+    if nums:
+        return max(int(x) for x in nums)
+    return 1
+
+
+def format_cpuload(value):
+    if value is None:
+        return "?"
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return "?"
+        try:
+            f = float(s)
+        except ValueError:
+            return s
+    else:
+        try:
+            f = float(value)
+        except Exception:
+            return str(value)
+
+    # Some JSON outputs report hundredths (e.g. 3966 instead of 39.66).
+    if f >= 1000:
+        f = f / 100.0
+    return f"{f:.2f}"
+
+
+def make_job_block(jobid, span):
+    label = str(jobid)
+    inner_width = SLOT_WIDTH * span + (span - 1) - 2
+
+    if inner_width <= 0:
+        return "<>"
+    if inner_width <= len(label):
+        return "<" + label[:inner_width] + ">"
+    if span == 1:
+        return f"<{label:^{inner_width}}>"
+
+    pad = inner_width - len(label)
+    left = pad // 2
+    right = pad - left
+    return "<" + ("~" * left) + label + ("~" * right) + ">"
+
+
+def parse_top_squeue(text):
+    return text.rstrip("\n")
+
+
+def parse_running_squeue_text(text):
+    jobs_by_node = defaultdict(list)
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+
+        parts = re.split(r"\s+", line.strip(), maxsplit=3)
+        if len(parts) < 3:
+            continue
+
+        jobid = parts[0]
+        nodelist = parts[1]
+        tail = " ".join(parts[2:])
+        gpu_count = max(1, parse_gpu_count_from_text(tail))
+
+        for node in expand_nodelist(nodelist):
+            jobs_by_node[node].append({
+                "jobid": int(jobid),
+                "gpus": gpu_count,
+            })
+
+    return jobs_by_node
+
+
+def parse_running_squeue_json(text):
+    data = json.loads(text)
+    jobs_by_node = defaultdict(list)
+
+    for job in data.get("jobs", []):
+        job_id = job.get("job_id")
+        if job_id is None:
+            continue
+
+        try:
+            jobid = int(job_id)
+        except Exception:
+            continue
+
+        nodes = expand_nodelist(str(job.get("nodes", "")))
+        if not nodes:
+            continue
+
+        gpu_count = 1
+        for key in ("tres", "tres_per_node", "tres_alloc_str", "tres_req_str"):
+            if key in job and job[key] is not None:
+                blob = job[key] if isinstance(job[key], str) else json.dumps(job[key], separators=(",", ":"))
+                gpu_count = max(gpu_count, parse_gpu_count_from_text(blob))
+
+        for node in nodes:
+            jobs_by_node[node].append({
+                "jobid": jobid,
+                "gpus": gpu_count,
+            })
+
+    return jobs_by_node
+
+
+def parse_nodes_sinfo(text):
+    nodes = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split("|", 3)
+        if len(parts) < 4:
+            continue
+        name, cpuload, state, gres = [p.strip() for p in parts]
+        if not name:
+            continue
+
+        total_gpus = max(1, parse_gpu_count_from_text(gres))
+        state = state.upper().split("+", 1)[0]
+        cpuload = format_cpuload(cpuload)
+
+        prev = nodes.get(name)
+        if prev is None:
+            nodes[name] = {
+                "cpuload": cpuload,
+                "state": state,
+                "total_gpus": total_gpus,
+            }
+        else:
+            if prev["cpuload"] == "?" and cpuload != "?":
+                prev["cpuload"] = cpuload
+            if prev["state"] in ("UNKNOWN", "") and state not in ("UNKNOWN", ""):
+                prev["state"] = state
+            prev["total_gpus"] = max(prev["total_gpus"], total_gpus)
+    return nodes
+
+
+def parse_nodes_text(text):
+    nodes = {}
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        fields = dict(re.findall(r"(\w+)=([^\s]+)", line))
+        name = fields.get("NodeName")
+        if not name:
+            continue
+
+        cpuload = format_cpuload(fields.get("CPULoad", "?"))
+        state = fields.get("State", "UNKNOWN").split("+", 1)[0].upper()
+        cfg_tres = fields.get("CfgTRES", "")
+        gres = fields.get("Gres", "")
+
+        total_gpus = max(parse_gpu_count_from_text(cfg_tres), parse_gpu_count_from_text(gres))
+        if total_gpus < 1:
+            total_gpus = 8
+
+        nodes[name] = {
+            "cpuload": cpuload,
+            "state": state,
+            "total_gpus": total_gpus,
+        }
+
+    return nodes
+
+
+def parse_nodes_json(text):
+    data = json.loads(text)
+    nodes = {}
+
+    for node in data.get("nodes", []):
+        name = node.get("name")
+        if not name:
+            continue
+
+        state_field = node.get("state")
+        if isinstance(state_field, list) and state_field:
+            state = str(state_field[0]).upper()
+        elif isinstance(state_field, str):
+            state = state_field.split("+", 1)[0].upper()
+        else:
+            state = "UNKNOWN"
+
+        total_gpus = 0
+        for key in ("tres", "tres_fmt_str", "config_tres", "gres"):
+            if key in node and node[key] is not None:
+                blob = node[key] if isinstance(node[key], str) else json.dumps(node[key], separators=(",", ":"))
+                total_gpus = max(total_gpus, parse_gpu_count_from_text(blob))
+
+        nodes[name] = {
+            "cpuload": format_cpuload(node.get("cpu_load", "?")),
+            "state": state,
+            "total_gpus": max(1, total_gpus or 8),
+        }
+
+    return nodes
+
+
+def get_top_table():
+    return parse_top_squeue(run_cmd(["squeue"]))
+
+
+def get_running_jobs():
+    text = try_cmd(["squeue", "--json", "-a", "-h", "-t", "R"])
+    if text:
+        try:
+            return parse_running_squeue_json(text)
+        except Exception:
+            pass
+
+    text = run_cmd(["squeue", "-a", "-h", "-t", "R", "-O", "JobID:20,NodeList:40,tres-alloc:40,tres-per-node:40"])
+    return parse_running_squeue_text(text)
+
+
+def get_nodes():
+    nodes = {}
+
+    # use sinfo here because it can expose all partitions/nodes and directly gives CPU load (%O).
+    text = try_cmd(["sinfo", "-a", "-N", "-h", "-o", "%N|%O|%T|%G"])
+    if text:
+        try:
+            nodes.update(parse_nodes_sinfo(text))
+        except Exception:
+            pass
+
+    text = try_cmd(["scontrol", "--json", "show", "node"])
+    if text:
+        try:
+            for name, info in parse_nodes_json(text).items():
+                nodes.setdefault(name, info)
+                nodes[name]["cpuload"] = info["cpuload"] if nodes[name].get("cpuload", "?") == "?" else nodes[name]["cpuload"]
+                if nodes[name].get("state", "UNKNOWN") == "UNKNOWN":
+                    nodes[name]["state"] = info["state"]
+                nodes[name]["total_gpus"] = max(nodes[name].get("total_gpus", 1), info["total_gpus"])
+        except Exception:
+            pass
+
+    if not nodes:
+        text = run_cmd(["scontrol", "show", "node", "-o"])
+        nodes.update(parse_nodes_text(text))
+
+    return nodes
+
+
+def render_bottom_table(nodes, jobs_by_node):
+    if not nodes:
+        return ""
+
+    max_slots = max(info["total_gpus"] for info in nodes.values())
+    node_w = max(8, max(len(n) for n in nodes)) + 1  # match the left margin in the sample
+    cpu_w = max(6, max(len(info["cpuload"]) for info in nodes.values()))
+    state_w = max(5, max(len(info["state"]) for info in nodes.values()))
+
+    header = " " * node_w + "|"
+    for i in range(1, max_slots + 1):
+        header += f" {'#' + str(i):^{SLOT_WIDTH - 2}} |"
+    header += f" {'%CPU':>{cpu_w}} | {'State':<{state_w}}"
+
+    sep = "-" * node_w + "|"
+    for i in range(1, max_slots + 1):
+        sep += "-" * SLOT_WIDTH
+        sep += "+" if i != max_slots else "|"
+    sep += "-" * (cpu_w + 2) + "|" + "-" * (state_w + 2)
+
+    lines = [header, sep]
+
+    for node in sorted(nodes, key=natural_node_key):
+        info = nodes[node]
+        total_slots = info["total_gpus"]
+        jobs = sorted(jobs_by_node.get(node, []), key=lambda j: j["jobid"])
+
+        row = f"{node:>{node_w}}|"
+        used = 0
+
+        for job in jobs:
+            span = max(1, int(job["gpus"]))
+            if used >= total_slots:
+                break
+            if used + span > total_slots:
+                span = total_slots - used
+            row += make_job_block(job["jobid"], span) + "|"
+            used += span
+
+        while used < total_slots:
+            row += (" " * SLOT_WIDTH) + "|"
+            used += 1
+
+        row += f" {info['cpuload']:>{cpu_w}} | {info['state']:<{state_w}}"
+        lines.append(row)
+
+    return "\n".join(lines)
+
+
+def main():
+    for cmd in ("squeue", "scontrol", "sinfo"):
+        if not shutil.which(cmd):
+            print(f"Error: {cmd} not found in PATH", file=sys.stderr)
+            sys.exit(1)
+
+    top = get_top_table()
+    jobs_by_node = get_running_jobs()
+    nodes = get_nodes()
+
+    for node, jobs in jobs_by_node.items():
+        if node not in nodes:
+            inferred = sum(max(1, int(j.get("gpus", 1))) for j in jobs)
+            nodes[node] = {
+                "cpuload": "?",
+                "state": "UNKNOWN",
+                "total_gpus": max(8, inferred),
+            }
+
+    # print(top)
+    # print()
+    # print("---")
+    # print()
+    print(render_bottom_table(nodes, jobs_by_node))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as e:
+        print(f"Error running: {' '.join(e.cmd)}", file=sys.stderr)
+        sys.exit(e.returncode if e.returncode else 1)
+
