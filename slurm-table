@@ -7,6 +7,81 @@ import sys
 from collections import defaultdict
 
 SLOT_WIDTH = 8
+CPU_MODE = "allocated"
+
+
+def usage():
+    prog = sys.argv[0] if sys.argv and sys.argv[0] else "slurm-table"
+    print(
+        "Usage: {} [--slot-width N] [--cpu-mode percentage|allocated]".format(prog),
+        file=sys.stderr,
+    )
+
+
+def parse_args(argv):
+    global SLOT_WIDTH, CPU_MODE
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+
+        if arg in ("-h", "--help"):
+            usage()
+            sys.exit(0)
+        elif arg == "--slot-width":
+            i += 1
+            if i >= len(argv):
+                print("Error: --slot-width requires a value", file=sys.stderr)
+                usage()
+                sys.exit(2)
+            try:
+                SLOT_WIDTH = int(argv[i])
+            except ValueError:
+                print("Error: --slot-width must be an integer", file=sys.stderr)
+                sys.exit(2)
+            if SLOT_WIDTH < 3:
+                print("Error: --slot-width must be >= 3", file=sys.stderr)
+                sys.exit(2)
+        elif arg.startswith("--slot-width="):
+            try:
+                SLOT_WIDTH = int(arg.split("=", 1)[1])
+            except ValueError:
+                print("Error: --slot-width must be an integer", file=sys.stderr)
+                sys.exit(2)
+            if SLOT_WIDTH < 3:
+                print("Error: --slot-width must be >= 3", file=sys.stderr)
+                sys.exit(2)
+        elif arg == "--cpu-mode":
+            i += 1
+            if i >= len(argv):
+                print("Error: --cpu-mode requires a value", file=sys.stderr)
+                usage()
+                sys.exit(2)
+            CPU_MODE = argv[i]
+        elif arg.startswith("--cpu-mode="):
+            CPU_MODE = arg.split("=", 1)[1]
+        else:
+            print("Error: unknown argument: {}".format(arg), file=sys.stderr)
+            usage()
+            sys.exit(2)
+
+        i += 1
+
+    if CPU_MODE not in ("percentage", "allocated"):
+        print(
+            "Error: --cpu-mode must be one of: percentage, allocated", file=sys.stderr
+        )
+        sys.exit(2)
+
+
+def format_cpu_field(info):
+    if CPU_MODE == "allocated":
+        total = info.get("cpu_total")
+        alloc = info.get("cpu_alloc")
+        if total is None or alloc is None or total <= 0:
+            return "?/?"
+        return "{}/{}".format(alloc, total)
+    return info["cpuload"]
 
 
 def run_cmd(cmd):
@@ -201,16 +276,27 @@ def parse_nodes_sinfo(text):
         line = raw.strip()
         if not line:
             continue
-        parts = line.split("|", 3)
-        if len(parts) < 4:
+        parts = line.split("|", 4)
+        if len(parts) < 5:
             continue
-        name, cpuload, state, gres = [p.strip() for p in parts]
+        name, cpuload, state, gres, cpu_summary = [p.strip() for p in parts]
         if not name:
             continue
 
         total_gpus = max(1, parse_gpu_count_from_text(gres))
         state = state.upper().split("+", 1)[0]
         cpuload = format_cpuload(cpuload)
+        cpu_alloc = None
+        cpu_total = None
+
+        cpu_parts = cpu_summary.split("/")
+        if len(cpu_parts) == 4:
+            try:
+                cpu_alloc = int(cpu_parts[0])
+                cpu_total = int(cpu_parts[3])
+            except Exception:
+                cpu_alloc = None
+                cpu_total = None
 
         prev = nodes.get(name)
         if prev is None:
@@ -218,6 +304,8 @@ def parse_nodes_sinfo(text):
                 "cpuload": cpuload,
                 "state": state,
                 "total_gpus": total_gpus,
+                "cpu_alloc": cpu_alloc,
+                "cpu_total": cpu_total,
             }
         else:
             if prev["cpuload"] == "?" and cpuload != "?":
@@ -225,6 +313,10 @@ def parse_nodes_sinfo(text):
             if prev["state"] in ("UNKNOWN", "") and state not in ("UNKNOWN", ""):
                 prev["state"] = state
             prev["total_gpus"] = max(prev["total_gpus"], total_gpus)
+            if prev.get("cpu_alloc") is None and cpu_alloc is not None:
+                prev["cpu_alloc"] = cpu_alloc
+            if prev.get("cpu_total") is None and cpu_total is not None:
+                prev["cpu_total"] = cpu_total
     return nodes
 
 
@@ -245,6 +337,8 @@ def parse_nodes_text(text):
         state = fields.get("State", "UNKNOWN").split("+", 1)[0].upper()
         cfg_tres = fields.get("CfgTRES", "")
         gres = fields.get("Gres", "")
+        cpu_alloc = fields.get("CPUAlloc")
+        cpu_total = fields.get("CPUTot")
 
         total_gpus = max(
             parse_gpu_count_from_text(cfg_tres), parse_gpu_count_from_text(gres)
@@ -256,6 +350,8 @@ def parse_nodes_text(text):
             "cpuload": cpuload,
             "state": state,
             "total_gpus": total_gpus,
+            "cpu_alloc": int(cpu_alloc) if cpu_alloc and cpu_alloc.isdigit() else None,
+            "cpu_total": int(cpu_total) if cpu_total and cpu_total.isdigit() else None,
         }
 
     return nodes
@@ -287,11 +383,30 @@ def parse_nodes_json(text):
                     else json.dumps(node[key], separators=(",", ":"))
                 )
                 total_gpus = max(total_gpus, parse_gpu_count_from_text(blob))
+        cpu_alloc = None
+        cpu_total = None
+
+        for key in ("cpu_alloc", "alloc_cpus", "allocated_cpus"):
+            if key in node and node[key] is not None:
+                try:
+                    cpu_alloc = int(node[key])
+                    break
+                except Exception:
+                    pass
+        for key in ("cpus", "cpu_tot", "effective_cpus"):
+            if key in node and node[key] is not None:
+                try:
+                    cpu_total = int(node[key])
+                    break
+                except Exception:
+                    pass
 
         nodes[name] = {
             "cpuload": format_cpuload(node.get("cpu_load", "?")),
             "state": state,
             "total_gpus": max(1, total_gpus or 8),
+            "cpu_alloc": cpu_alloc,
+            "cpu_total": cpu_total,
         }
 
     return nodes
@@ -330,7 +445,7 @@ def get_nodes():
     nodes = {}
 
     # use sinfo here because it can expose all partitions/nodes and directly gives CPU load (%O).
-    text = try_cmd(["sinfo", "-a", "-N", "-h", "-o", "%N|%O|%T|%G"])
+    text = try_cmd(["sinfo", "-a", "-N", "-h", "-o", "%N|%O|%T|%G|%C"])
     if text:
         try:
             nodes.update(parse_nodes_sinfo(text))
@@ -349,6 +464,16 @@ def get_nodes():
                 )
                 if nodes[name].get("state", "UNKNOWN") == "UNKNOWN":
                     nodes[name]["state"] = info["state"]
+                if (
+                    nodes[name].get("cpu_alloc") is None
+                    and info.get("cpu_alloc") is not None
+                ):
+                    nodes[name]["cpu_alloc"] = info["cpu_alloc"]
+                if (
+                    nodes[name].get("cpu_total") is None
+                    and info.get("cpu_total") is not None
+                ):
+                    nodes[name]["cpu_total"] = info["cpu_total"]
                 nodes[name]["total_gpus"] = max(
                     nodes[name].get("total_gpus", 1), info["total_gpus"]
                 )
@@ -370,13 +495,16 @@ def render_bottom_table(nodes, jobs_by_node):
     node_w = (
         max(8, max(len(n) for n in nodes)) + 1
     )  # match the left margin in the sample
-    cpu_w = max(6, max(len(info["cpuload"]) for info in nodes.values()))
+    cpu_label = "%CPU" if CPU_MODE == "percentage" else "CPU A/F"
+    cpu_w = max(
+        len(cpu_label), max(len(format_cpu_field(info)) for info in nodes.values())
+    )
     state_w = max(5, max(len(info["state"]) for info in nodes.values()))
 
     header = " " * node_w + "|"
     for i in range(1, max_slots + 1):
         header += f" {'#' + str(i):^{SLOT_WIDTH - 2}} |"
-    header += f" {'%CPU':>{cpu_w}} | {'State':<{state_w}}"
+    header += f" {cpu_label:>{cpu_w}} | {'State':<{state_w}}"
 
     sep = "-" * node_w + "|"
     for i in range(1, max_slots + 1):
@@ -407,13 +535,14 @@ def render_bottom_table(nodes, jobs_by_node):
             row += (" " * SLOT_WIDTH) + "|"
             used += 1
 
-        row += f" {info['cpuload']:>{cpu_w}} | {info['state']:<{state_w}}"
+        row += f" {format_cpu_field(info):>{cpu_w}} | {info['state']:<{state_w}}"
         lines.append(row)
 
     return "\n".join(lines)
 
 
 def main():
+    parse_args(sys.argv[1:])
     for cmd in ("squeue", "scontrol", "sinfo"):
         if not shutil.which(cmd):
             print(f"Error: {cmd} not found in PATH", file=sys.stderr)
@@ -430,6 +559,8 @@ def main():
                 "cpuload": "?",
                 "state": "UNKNOWN",
                 "total_gpus": max(8, inferred),
+                "cpu_alloc": None,
+                "cpu_total": None,
             }
     # if top:
     #     print(top)
